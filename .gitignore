@@ -1,0 +1,21 @@
+# Ignore Go build artifacts
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Ignore IDE and editor files
+.idea/
+*.swp
+*.swo
+*.swn
+
+# Ignore OS generated files
+.DS_Store
+Thumbs.db
+
+# Ignore temporary files
+*.tmp
+*.log
+awsm
