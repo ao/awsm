@@ -18,4 +18,5 @@ Thumbs.db
 # Ignore temporary files
 *.tmp
 *.log
+awsm*.json
 awsm

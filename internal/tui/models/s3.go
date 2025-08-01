@@ -81,38 +81,46 @@ func (m *S3Model) Init() tea.Cmd {
 
 	m.loading = true
 	m.loadingStartTime = time.Now()
+	m.err = nil
 
 	logger.Debug("S3Model.Init returning commands")
 
 	// Create a debug file to verify this function is being called
 	f, _ := os.Create("s3_init_debug_new.log")
 	if f != nil {
-		f.WriteString("S3Model.Init called\n")
+		f.WriteString(fmt.Sprintf("S3Model.Init called at %s\n", time.Now().String()))
 		f.Close()
 	}
 
-	// Directly call loadBuckets and handle the result
-	result := m.loadBuckets()
+	// Return a command that will load buckets asynchronously
+	return tea.Batch(
+		m.asyncLoadBuckets,
+		m.startTimeoutCheck,
+	)
+}
 
-	// Log the result
-	f2, _ := os.Create("s3_init_result.log")
-	if f2 != nil {
-		if msg, ok := result.(S3BucketMsg); ok {
-			if msg.Error != nil {
-				f2.WriteString(fmt.Sprintf("Error: %v\n", msg.Error))
-			} else {
-				f2.WriteString(fmt.Sprintf("Buckets: %d\n", len(msg.Buckets)))
+// startTimeoutCheck starts a periodic check for timeout
+func (m *S3Model) startTimeoutCheck() tea.Msg {
+	// Check every second if we've exceeded the timeout
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if !m.loading {
+				// If we're no longer loading, stop checking
+				return nil
 			}
-		} else {
-			f2.WriteString(fmt.Sprintf("Unknown result type: %T\n", result))
-		}
-		f2.Close()
-	}
 
-	// Return a command that returns the result directly
-	return func() tea.Msg {
-		logger.Debug("Returning S3BucketMsg from Init command")
-		return result
+			if time.Since(m.loadingStartTime) > m.loadingTimeout {
+				// We've exceeded the timeout
+				return TimeoutMsg{
+					Message: "Operation timed out after " + m.loadingTimeout.String(),
+					Source:  "S3Model",
+				}
+			}
+		}
 	}
 }
 
@@ -139,19 +147,19 @@ func (m *S3Model) checkTimeout() tea.Msg {
 	})
 }
 
-// loadBuckets loads S3 buckets
-func (m *S3Model) loadBuckets() tea.Msg {
-	logger.Debug("S3Model.loadBuckets called")
+// asyncLoadBuckets loads S3 buckets asynchronously
+func (m *S3Model) asyncLoadBuckets() tea.Msg {
+	logger.Debug("S3Model.asyncLoadBuckets called")
 
 	// Create a debug file to verify this function is being called
-	f, _ := os.Create("s3_loadbuckets_debug.log")
+	f, _ := os.Create("s3_asyncload_debug.log")
 	if f != nil {
-		f.WriteString("S3Model.loadBuckets called\n")
+		f.WriteString(fmt.Sprintf("S3Model.asyncLoadBuckets called at %s\n", time.Now().String()))
 		f.Close()
 	}
 
-	// Set a timeout to ensure we don't get stuck in a loading state
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Use a longer timeout since we know the operation can take ~17.5 seconds
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Create S3 adapter if not already created
@@ -211,6 +219,16 @@ func (m *S3Model) loadBuckets() tea.Msg {
 		}
 	} else {
 		logger.Info("Found %d S3 buckets", len(buckets))
+		
+		// Create a debug file with the results
+		f, _ := os.Create("s3_buckets_result.log")
+		if f != nil {
+			f.WriteString(fmt.Sprintf("Found %d buckets at %s\n", len(buckets), time.Now().String()))
+			for _, bucket := range buckets {
+				f.WriteString(fmt.Sprintf("- %s (%s)\n", bucket.Name, bucket.Region))
+			}
+			f.Close()
+		}
 	}
 
 	return S3BucketMsg{
@@ -224,8 +242,16 @@ func (m *S3Model) loadObjects() tea.Cmd {
 	return func() tea.Msg {
 		logger.Debug("S3Model.loadObjects called for bucket: %s", m.currentBucket)
 
-		// Set a timeout to ensure we don't get stuck in a loading state
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Create a debug file to verify this function is being called
+		f, _ := os.Create("s3_loadobjects_debug.log")
+		if f != nil {
+			f.WriteString(fmt.Sprintf("S3Model.loadObjects called for bucket %s at %s\n",
+				m.currentBucket, time.Now().String()))
+			f.Close()
+		}
+
+		// Use a longer timeout since we know the operation can take time
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		if m.adapter == nil {
@@ -263,8 +289,33 @@ func (m *S3Model) loadObjects() tea.Cmd {
 		objects, err := m.adapter.ListObjects(ctx, m.currentBucket, "", 0)
 		if err != nil {
 			logger.Error("Error listing objects in bucket %s: %v", m.currentBucket, err)
+			
+			// Create a debug file with the error
+			f, _ := os.Create("s3_objects_error.log")
+			if f != nil {
+				f.WriteString(fmt.Sprintf("Error listing objects in bucket %s: %v at %s\n",
+					m.currentBucket, err, time.Now().String()))
+				f.Close()
+			}
 		} else {
 			logger.Info("Found %d objects in bucket %s", len(objects), m.currentBucket)
+			
+			// Create a debug file with the results
+			f, _ := os.Create("s3_objects_result.log")
+			if f != nil {
+				f.WriteString(fmt.Sprintf("Found %d objects in bucket %s at %s\n",
+					len(objects), m.currentBucket, time.Now().String()))
+				if len(objects) > 0 {
+					f.WriteString("First 5 objects:\n")
+					for i, obj := range objects {
+						if i >= 5 {
+							break
+						}
+						f.WriteString(fmt.Sprintf("- %s (%d bytes)\n", obj.Key, obj.Size))
+					}
+				}
+				f.Close()
+			}
 		}
 
 		return S3ObjectMsg{
@@ -281,29 +332,51 @@ func (m *S3Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case S3BucketMsg:
 		logger.Debug("Received S3BucketMsg")
-		if msg.Error != nil {
-			logger.Error("S3BucketMsg error: %v", msg.Error)
-		} else {
-			logger.Debug("S3BucketMsg contains %d buckets", len(msg.Buckets))
+		
+		// Create a debug file to verify message handling
+		f, _ := os.Create("s3_update_bucket_msg.log")
+		if f != nil {
+			if msg.Error != nil {
+				f.WriteString(fmt.Sprintf("Error: %v at %s\n", msg.Error, time.Now().String()))
+			} else {
+				f.WriteString(fmt.Sprintf("Received %d buckets at %s\n", len(msg.Buckets), time.Now().String()))
+			}
+			f.Close()
 		}
-
+		
 		m.loading = false
 		if msg.Error != nil {
+			logger.Error("S3BucketMsg error: %v", msg.Error)
 			m.err = msg.Error
 			return m, nil
 		}
+		
+		logger.Debug("S3BucketMsg contains %d buckets", len(msg.Buckets))
 		m.buckets = msg.Buckets
 		m.err = nil
 		return m, nil
 
 	case S3ObjectMsg:
 		logger.Debug("Received S3ObjectMsg")
+		
+		// Create a debug file to verify message handling
+		f, _ := os.Create("s3_update_object_msg.log")
+		if f != nil {
+			if msg.Error != nil {
+				f.WriteString(fmt.Sprintf("Error: %v at %s\n", msg.Error, time.Now().String()))
+			} else {
+				f.WriteString(fmt.Sprintf("Received %d objects at %s\n", len(msg.Objects), time.Now().String()))
+			}
+			f.Close()
+		}
+		
 		m.loading = false
 		if msg.Error != nil {
 			logger.Error("S3ObjectMsg error: %v", msg.Error)
 			m.err = msg.Error
 			return m, nil
 		}
+		
 		logger.Debug("S3ObjectMsg contains %d objects", len(msg.Objects))
 		m.objects = msg.Objects
 		m.err = nil
@@ -315,6 +388,15 @@ func (m *S3Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			logger.Warn("S3Model operation timed out after %v", m.loadingTimeout)
 			m.loading = false
 			m.err = fmt.Errorf("operation timed out after %v", m.loadingTimeout)
+			
+			// Create a debug file for the timeout
+			f, _ := os.Create("s3_timeout.log")
+			if f != nil {
+				f.WriteString(fmt.Sprintf("Operation timed out after %v at %s\n",
+					m.loadingTimeout, time.Now().String()))
+				f.Close()
+			}
+			
 			return m, nil
 		}
 
@@ -349,7 +431,21 @@ func (m *S3Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				m.currentBucket = m.buckets[m.selectedBucket].Name
 				m.title = fmt.Sprintf("S3 Objects: %s", m.currentBucket)
 				m.loading = true
-				return m, m.loadObjects()
+				m.loadingStartTime = time.Now()
+				m.err = nil
+				
+				// Create a debug file for entering bucket view
+				f, _ := os.Create("s3_enter_bucket.log")
+				if f != nil {
+					f.WriteString(fmt.Sprintf("Entering bucket %s at %s\n",
+						m.currentBucket, time.Now().String()))
+					f.Close()
+				}
+				
+				return m, tea.Batch(
+					m.loadObjects(),
+					m.startTimeoutCheck,
+				)
 			}
 		case key.Matches(msg, DefaultKeyMap().Escape):
 			if m.viewingObjects {
@@ -360,12 +456,26 @@ func (m *S3Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 		case key.Matches(msg, DefaultKeyMap().Refresh):
 			m.loading = true
+			m.loadingStartTime = time.Now()
+			m.err = nil
+			
+			// Create a debug file for refresh action
+			f, _ := os.Create("s3_refresh.log")
+			if f != nil {
+				f.WriteString(fmt.Sprintf("Refreshing at %s\n", time.Now().String()))
+				f.Close()
+			}
+			
 			if m.viewingObjects {
-				return m, m.loadObjects()
+				return m, tea.Batch(
+					m.loadObjects(),
+					m.startTimeoutCheck,
+				)
 			} else {
-				return m, func() tea.Msg {
-					return m.loadBuckets()
-				}
+				return m, tea.Batch(
+					m.asyncLoadBuckets,
+					m.startTimeoutCheck,
+				)
 			}
 		}
 	}
